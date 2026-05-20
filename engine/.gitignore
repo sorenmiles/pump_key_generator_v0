@@ -1,0 +1,9 @@
+# secrets / local config
+.env
+
+# temp folder
+/temp/
+
+# build output folders
+/libs/
+/dist/

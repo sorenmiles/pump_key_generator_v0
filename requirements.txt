@@ -1,0 +1,5 @@
+# Python deps for the orchestrator/verifier (find_pump_keys.py).
+# The CUDA engine itself has no Python dependency.
+pymongo>=4.6,<5
+solders>=0.21          # trusted ed25519 / Solana keypair derivation + verify
+base58>=2.1
