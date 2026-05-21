@@ -41,7 +41,31 @@ import base58
 from solders.keypair import Keypair
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BIN = os.path.join(HERE, "engine", "src", "release", "cuda_ed25519_vanity")
+_BIN_NAME = "cuda_ed25519_vanity.exe" if os.name == "nt" else "cuda_ed25519_vanity"
+DEFAULT_BIN = os.path.join(HERE, "engine", "src", "release", _BIN_NAME)
+
+
+def _load_dotenv():
+    """Load KEY=VALUE pairs from a sibling .env file (no dependency needed).
+
+    Cross-platform convenience so Windows users don't need `source .env`. Real
+    environment variables already set take precedence over the file.
+    """
+    path = os.path.join(HERE, ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            os.environ.setdefault(key, val)
+
+
+_load_dotenv()
 
 
 def env(name, default=None):
@@ -124,13 +148,21 @@ def store(coll, address, private_key_b58, secret_key_json):
 
 
 def build_subprocess_env():
-    """Engine binary links libcuda-crypt.so by path; expose it at runtime."""
+    """Make sure the engine can find any co-located libs at runtime.
+
+    On Linux the Makefile build links libcuda-crypt.so by path, so we add the
+    binary's directory to LD_LIBRARY_PATH. On Windows the engine is a standalone
+    .exe (no DLL), but we still prepend its directory to PATH for safety.
+    """
     child_env = dict(os.environ)
     lib_dir = os.path.dirname(VANITY_BIN)  # .../engine/src/release
-    existing = child_env.get("LD_LIBRARY_PATH", "")
-    child_env["LD_LIBRARY_PATH"] = (
-        lib_dir + (os.pathsep + existing if existing else "")
-    )
+    if os.name == "nt":
+        child_env["PATH"] = lib_dir + os.pathsep + child_env.get("PATH", "")
+    else:
+        existing = child_env.get("LD_LIBRARY_PATH", "")
+        child_env["LD_LIBRARY_PATH"] = (
+            lib_dir + (os.pathsep + existing if existing else "")
+        )
     return child_env
 
 
@@ -174,9 +206,13 @@ def main():
     seen_addresses = set()
 
     def shutdown(*_):
+        if proc.poll() is not None:
+            return
         log("\n>> Stopping engine...")
         try:
-            proc.send_signal(signal.SIGINT)
+            # Windows can't deliver SIGINT to another process; terminate() maps
+            # to TerminateProcess there and SIGTERM on POSIX.
+            proc.terminate()
             proc.wait(timeout=10)
         except Exception:
             proc.kill()

@@ -4,14 +4,15 @@
 
 #include <assert.h>
 #include <inttypes.h>
-#include <pthread.h>
 #include <stdio.h>
 
 #include "curand_kernel.h"
 #include "ed25519.h"
 #include "fixedint.h"
 #include "gpu_common.h"
-#include "gpu_ctx.h"
+// NOTE: gpu_ctx.h and <pthread.h> are intentionally NOT included. They are
+// unused here and pull in POSIX-only types (pthread_mutex_t), which lets this
+// file compile as a standalone .exe with nvcc + MSVC on Windows.
 
 #include "keypair.cu"
 #include "sc.cu"
@@ -38,8 +39,9 @@ bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
 /* -- Entry Point ----------------------------------------------------------- */
 
 int main(int argc, char const* argv[]) {
-	ed25519_set_verbose(true);
-
+	// (Upstream called ed25519_set_verbose() here; that symbol lives in the
+	// shared library and is only a logging flag, so it is dropped to keep this
+	// translation unit self-contained / standalone-buildable on Windows.)
 	config vanity;
 	vanity_setup(vanity);
 	vanity_run(vanity);
@@ -150,6 +152,10 @@ void vanity_run(config &vanity) {
 			elapsed.count(),
 			(8 * 8 * 256 * 100000) / elapsed.count()
 		);
+		// Push device printf("FOUND ...") and the line above through the pipe
+		// immediately so the host harness sees matches without buffering delay
+		// (there is no stdbuf on Windows).
+		fflush(stdout);
 	}
 }
 

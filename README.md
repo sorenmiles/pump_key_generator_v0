@@ -14,7 +14,7 @@ verified keypair in MongoDB with `private_key`, `public_key`, and `isused=false`
 
 The GPU engine is a patched build of [ChorusOne/solanity](https://github.com/ChorusOne/solanity)
 (a proven CUDA ed25519 implementation), so the hard cryptography is battle-tested
-rather than hand-written. See [What was changed vs. upstream](#what-was-changed-vs-upstream).
+rather than hand-written. See [What was changed vs. upstream solanity](#what-was-changed-vs-upstream-solanity).
 
 ---
 
@@ -50,57 +50,90 @@ with the suffix. Only then is it stored. (This re-derivation is unit-tested in
 
 ---
 
-## Prerequisites (on the GPU machine)
+## Windows (native) — recommended for an RTX 2060 on Windows
 
-- NVIDIA GPU + driver (check: `nvidia-smi`)
-- **CUDA Toolkit** with `nvcc` on `PATH` (check: `nvcc --version`)
-- Python 3.8+
-- A MongoDB connection string (Atlas or self-hosted)
+**Prerequisites**
+- NVIDIA GPU + driver (check in a terminal: `nvidia-smi`)
+- **CUDA Toolkit** for Windows (`nvcc --version` works)
+- **Visual Studio Build Tools** with the *Desktop development with C++* workload
+  — this provides `cl.exe`, which `nvcc` needs as the host compiler.
+- Python 3.8+ (`py --version`)
+
+**Build & run** — open the **“x64 Native Tools Command Prompt for VS”** (so
+`cl.exe` is on PATH), `cd` into this folder, then:
+
+```bat
+REM 1) Python deps for the orchestrator (the CUDA engine has no Python deps)
+py -m pip install -r requirements.txt
+
+REM 2) Build the engine to a standalone .exe (auto-detects your GPU arch)
+build.bat
+REM -> produces engine\src\release\cuda_ed25519_vanity.exe
+REM    (RTX 2060 = sm_75; override with:  set GPU_ARCH=sm_75 & build.bat)
+
+REM 3) Configure: copy .env.example to .env and set MONGODB_URI
+copy .env.example .env
+notepad .env
+
+REM 4) Run (find_pump_keys.py auto-loads .env — no "source" needed)
+py find_pump_keys.py
+```
+
+Native Windows compiles `vanity.cu` directly into a single self-contained
+`.exe` — no Makefile, `.so`, or `LD_LIBRARY_PATH` involved.
+
+> **Easier alternative:** if you'd rather not install Visual Studio, use **WSL2**
+> (Ubuntu) on your Windows machine with the NVIDIA WSL driver + CUDA Toolkit, and
+> follow the Linux steps below unchanged. CUDA-on-WSL2 is fully supported.
 
 ---
 
-## Setup
+## Linux / WSL2
+
+**Prerequisites:** NVIDIA driver (`nvidia-smi`), CUDA Toolkit (`nvcc --version`),
+Python 3.8+, and a MongoDB URI.
 
 ```bash
-# 1) Python deps for the orchestrator (the CUDA engine has no Python deps)
+# 1) Python deps
 python3 -m pip install -r requirements.txt
 
-# 2) Build the GPU engine (auto-detects your GPU's compute capability)
+# 2) Build the engine (auto-detects your GPU's compute capability)
 ./build.sh
 # -> produces engine/src/release/cuda_ed25519_vanity
 
 # 3) Configure
-cp .env.example .env
-#   edit .env and set MONGODB_URI (and optionally DB/collection/target)
+cp .env.example .env          # edit and set MONGODB_URI
+
+# 4) Run (auto-loads .env)
+python3 find_pump_keys.py
 ```
 
 If `build.sh` can't detect your card, pass the arch explicitly:
 
 ```bash
-GPU_ARCHS=sm_86 GPU_PTX_ARCH=compute_86 ./build.sh   # e.g. RTX 30xx = 86
+GPU_ARCHS=sm_75 GPU_PTX_ARCH=compute_75 ./build.sh   # RTX 2060 = 75
 ```
 
-Common compute capabilities: RTX 20xx/T4 = `75`, A100 = `80`, RTX 30xx = `86`,
-RTX 40xx/L4 = `89`, H100 = `90`.
+Common compute capabilities: RTX 2060/20xx/T4 = `75`, A100 = `80`,
+RTX 30xx = `86`, RTX 40xx/L4 = `89`, H100 = `90`.
 
 ---
 
-## Run
+## Running
+
+The orchestrator launches the GPU search, verifies each hit, stores it, and
+exits once `TARGET_COUNT` new keys are stored (default `1`). Set `TARGET_COUNT=0`
+to keep mining a pool of unused keys until you press Ctrl-C.
+
+**Test the GPU without a database** (verifies & prints, writes nothing):
 
 ```bash
-# load .env into the environment, then run
-set -a; source .env; set +a
-python3 find_pump_keys.py
-```
-
-It launches the GPU search, verifies each hit, stores it, and exits once
-`TARGET_COUNT` new keys are stored (default `1`). Set `TARGET_COUNT=0` to keep
-mining a pool of unused keys until you press Ctrl-C.
-
-**Test the GPU without a database** (prints verified keys, writes nothing):
-
-```bash
+# Linux / WSL2
 DRY_RUN=1 TARGET_COUNT=1 python3 find_pump_keys.py
+```
+```bat
+REM Windows
+set DRY_RUN=1 & set TARGET_COUNT=1 & py find_pump_keys.py
 ```
 
 ---
