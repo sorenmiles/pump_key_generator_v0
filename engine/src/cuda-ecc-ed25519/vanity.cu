@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "curand_kernel.h"
 #include "ed25519.h"

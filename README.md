@@ -59,28 +59,34 @@ with the suffix. Only then is it stored. (This re-derivation is unit-tested in
   — this provides `cl.exe`, which `nvcc` needs as the host compiler.
 - Python 3.8+ (`py --version`)
 
-**Build & run** — open the **“x64 Native Tools Command Prompt for VS”** (so
-`cl.exe` is on PATH), `cd` into this folder, then:
+**Build & run** — `build.bat` auto-loads the Visual Studio C++ environment, so
+you can run it from a normal **PowerShell** (or cmd) prompt; no special
+"Native Tools" prompt needed. `cd` into this folder, then:
 
-```bat
-REM 1) Python deps for the orchestrator (the CUDA engine has no Python deps)
+```powershell
+# 1) Python deps for the orchestrator (the CUDA engine has no Python deps)
 py -m pip install -r requirements.txt
 
-REM 2) Build the engine to a standalone .exe (auto-detects your GPU arch)
-build.bat
-REM -> produces engine\src\release\cuda_ed25519_vanity.exe
-REM    (RTX 2060 = sm_75; override with:  set GPU_ARCH=sm_75 & build.bat)
+# 2) Build the engine to a standalone .exe (auto-detects your GPU arch)
+.\build.bat
+# -> produces engine\src\release\cuda_ed25519_vanity.exe
+#    Force the arch in PowerShell with:  $env:GPU_ARCH="sm_75"; .\build.bat
 
-REM 3) Configure: copy .env.example to .env and set MONGODB_URI
+# 3) Configure: copy .env.example to .env and set MONGODB_URI
 copy .env.example .env
 notepad .env
 
-REM 4) Run (find_pump_keys.py auto-loads .env — no "source" needed)
+# 4) Run (find_pump_keys.py auto-loads .env — no "source"/"set" needed)
 py find_pump_keys.py
 ```
 
+> In PowerShell you must prefix scripts with `.\` (`.\build.bat`), and `&` is not
+> a command separator — set env vars with `$env:NAME="value"` instead.
+
 Native Windows compiles `vanity.cu` directly into a single self-contained
-`.exe` — no Makefile, `.so`, or `LD_LIBRARY_PATH` involved.
+`.exe` — no Makefile, `.so`, or `LD_LIBRARY_PATH` involved. If `build.bat`
+reports it can't find Visual Studio, you must install the C++ tools (below) or
+switch to WSL2.
 
 > **Easier alternative:** if you'd rather not install Visual Studio, use **WSL2**
 > (Ubuntu) on your Windows machine with the NVIDIA WSL driver + CUDA Toolkit, and

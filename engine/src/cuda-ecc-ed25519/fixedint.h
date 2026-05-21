@@ -4,6 +4,14 @@
     Not a compatible replacement for <stdint.h>, do not blindly use it as such.
 */
 
+/* MSVC and any CUDA compile (nvcc) ship a real <stdint.h>; use it directly so
+   we don't emit manual typedefs that conflict with it (e.g. uint32_t declared
+   as `unsigned long` here vs `unsigned int` in MSVC's <stdint.h>). */
+#if !defined(FIXEDINT_H_INCLUDED) && (defined(_MSC_VER) || defined(__CUDACC__))
+    #include <stdint.h>
+    #define FIXEDINT_H_INCLUDED
+#endif
+
 #if ((defined(__STDC__) && __STDC__ && __STDC_VERSION__ >= 199901L) || (defined(__WATCOMC__) && (defined(_STDINT_H_INCLUDED) || __WATCOMC__ >= 1250)) || (defined(__GNUC__) && (defined(_STDINT_H) || defined(_STDINT_H_) || defined(__UINT_FAST64_TYPE__)) )) && !defined(FIXEDINT_H_INCLUDED)
     #include <stdint.h>
     #define FIXEDINT_H_INCLUDED

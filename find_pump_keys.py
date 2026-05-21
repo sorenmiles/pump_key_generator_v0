@@ -168,9 +168,14 @@ def build_subprocess_env():
 
 def build_command():
     """Wrap the binary in stdbuf -oL so matches reach us promptly."""
-    if not (os.path.isfile(VANITY_BIN) and os.access(VANITY_BIN, os.X_OK)):
-        log(f"ERROR: engine binary not found/executable: {VANITY_BIN}")
-        log("       Build it first:  ./build.sh")
+    # On Windows, os.access(X_OK) is unreliable; just require the file to exist.
+    ok = os.path.isfile(VANITY_BIN) and (
+        os.name == "nt" or os.access(VANITY_BIN, os.X_OK)
+    )
+    if not ok:
+        build_cmd = ".\\build.bat" if os.name == "nt" else "./build.sh"
+        log(f"ERROR: engine binary not found: {VANITY_BIN}")
+        log(f"       Build it first:  {build_cmd}")
         sys.exit(1)
     stdbuf = shutil.which("stdbuf")
     if stdbuf:
