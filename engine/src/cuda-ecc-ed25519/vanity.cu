@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "curand_kernel.h"
@@ -25,16 +26,20 @@
 /* -- Types ----------------------------------------------------------------- */
 
 typedef struct {
-	// CUDA Random States.
+	int             gpuCount;
+	// CUDA random states + the exact grid each GPU was initialized with, so the
+	// scan launches match the allocated state arrays.
 	curandState*    states[8];
+	int             blocks[8];   // grid size (fills all SMs)
+	int             threads[8];  // block size
 } config;
 
 /* -- Prototypes, Because C++ ----------------------------------------------- */
 
 void            vanity_setup(config& vanity);
-void            vanity_run(config& vanity);
+void            vanity_run(config& vanity, int attempts_per_thread);
 void __global__ vanity_init(unsigned long long seed_base, curandState* state);
-void __global__ vanity_scan(curandState* state);
+void __global__ vanity_scan(curandState* state, int attempts_per_thread);
 bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
 
 /* -- Entry Point ----------------------------------------------------------- */
@@ -43,9 +48,24 @@ int main(int argc, char const* argv[]) {
 	// (Upstream called ed25519_set_verbose() here; that symbol lives in the
 	// shared library and is only a logging flag, so it is dropped to keep this
 	// translation unit self-contained / standalone-buildable on Windows.)
+
+	// Seeds tried per thread per kernel launch. Default 0 = AUTO: the run loop
+	// auto-tunes this to keep each launch ~0.5s, which stays well under the
+	// Windows TDR limit (the OS resets the driver if a kernel blocks the display
+	// GPU for ~2s) while keeping the GPU busy. Set a fixed value via argv[1] or
+	// env VANITY_ATTEMPTS_PER_THREAD to disable auto-tuning.
+	int fixed_attempts = 0;
+	const char* envv = getenv("VANITY_ATTEMPTS_PER_THREAD");
+	if (envv && atoi(envv) > 0) fixed_attempts = atoi(envv);
+	if (argc > 1 && atoi(argv[1]) > 0) fixed_attempts = atoi(argv[1]);
+	if (fixed_attempts > 0)
+		printf("CONFIG: attempts_per_thread=%d (fixed)\n", fixed_attempts);
+	else
+		printf("CONFIG: attempts_per_thread=auto (adaptive, ~0.5s/launch)\n");
+
 	config vanity;
 	vanity_setup(vanity);
-	vanity_run(vanity);
+	vanity_run(vanity, fixed_attempts);
 }
 
 /* -- Vanity Step Functions ------------------------------------------------- */
@@ -54,6 +74,7 @@ void vanity_setup(config &vanity) {
 	printf("GPU: Initializing Memory\n");
 	int gpuCount = 0;
 	cudaGetDeviceCount(&gpuCount);
+	vanity.gpuCount = gpuCount;
 
 	// Create random states so kernels have access to random generators
 	// while running in the GPU.
@@ -109,16 +130,42 @@ void vanity_setup(config &vanity) {
 				.time_since_epoch().count())
 			^ ((unsigned long long)i << 56);
 
-		cudaMalloc((void **)&(vanity.states[i]), maxActiveBlocks * blockSize * sizeof(curandState));
-		vanity_init<<<maxActiveBlocks, blockSize>>>(seed_base, vanity.states[i]);
+		// IMPORTANT: maxActiveBlocks is the max resident blocks PER SM. To use
+		// the whole GPU we must launch that many blocks on EVERY SM, otherwise
+		// only a single SM is busy (this was the cause of low GPU utilization).
+		int blocks = maxActiveBlocks * device.multiProcessorCount;
+		vanity.blocks[i]  = blocks;
+		vanity.threads[i] = blockSize;
+		printf("GPU: launching %d blocks x %d threads = %d threads across %d SMs\n",
+			blocks, blockSize, blocks * blockSize, device.multiProcessorCount);
+
+		cudaMalloc((void **)&(vanity.states[i]), (size_t)blocks * blockSize * sizeof(curandState));
+		vanity_init<<<blocks, blockSize>>>(seed_base, vanity.states[i]);
 	}
 
 	printf("END: Initializing Memory\n");
 }
 
-void vanity_run(config &vanity) {
-	int gpuCount = 0;
-	cudaGetDeviceCount(&gpuCount);
+void vanity_run(config &vanity, int fixed_attempts) {
+	int gpuCount = vanity.gpuCount;
+
+	// Total threads across all GPUs is constant, so compute it once.
+	double total_threads = 0.0;
+	for (int i = 0; i < gpuCount; ++i)
+		total_threads += (double)vanity.blocks[i] * vanity.threads[i];
+
+	// Auto-tuning of seeds-per-thread-per-launch.
+	//
+	// We don't know the GPU's throughput ahead of time, and a launch that
+	// blocks the display GPU for ~2s trips Windows TDR (driver reset). So when
+	// no fixed value is given we start with a tiny, definitely-safe launch and
+	// converge toward TARGET_SEC per launch: long enough that the GPU stays
+	// ~fully busy, short enough to stay well under the TDR limit.
+	const double TARGET_SEC = 0.5;   // aim ~0.5s/launch (4x margin under 2s TDR)
+	const int    MIN_ATT    = 1;
+	const int    MAX_ATT    = 2000000;
+	bool adaptive = (fixed_attempts <= 0);
+	int  attempts = adaptive ? 8 : fixed_attempts;  // small, safe first probe
 
 	// Run until the process is terminated (the host harness stops us once it
 	// has collected and verified enough keys). Running standalone, stop with
@@ -126,16 +173,11 @@ void vanity_run(config &vanity) {
 	for (;;) {
 		auto start  = std::chrono::high_resolution_clock::now();
 
-		// Run on all GPUs
+		// Launch the (pre-sized) full-GPU grid on each device.
 		for (int i = 0; i < gpuCount; ++i) {
 			cudaSetDevice(i);
-			// Calculate Occupancy
-			int blockSize       = 0,
-			    minGridSize     = 0,
-			    maxActiveBlocks = 0;
-			cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[i]);
+			vanity_scan<<<vanity.blocks[i], vanity.threads[i]>>>(
+				vanity.states[i], attempts);
 		}
 
 		// Synchronize while we wait for kernels to complete. I do not
@@ -146,17 +188,27 @@ void vanity_run(config &vanity) {
 		cudaDeviceSynchronize();
 		auto finish = std::chrono::high_resolution_clock::now();
 
-		// Print out performance Summary
+		// Print out performance Summary (real numbers, not a hardcoded guess).
 		std::chrono::duration<double> elapsed = finish - start;
-		printf("Attempts: %d in %f at %fcps\n",
-			(8 * 8 * 256 * 100000),
-			elapsed.count(),
-			(8 * 8 * 256 * 100000) / elapsed.count()
-		);
+		double secs = elapsed.count();
+		double done = total_threads * (double)attempts;
+		printf("Attempts: %.0f in %f at %.0f keys/sec (att/thread=%d)\n",
+			done, secs, secs > 0 ? done / secs : 0.0, attempts);
 		// Push device printf("FOUND ...") and the line above through the pipe
 		// immediately so the host harness sees matches without buffering delay
 		// (there is no stdbuf on Windows).
 		fflush(stdout);
+
+		// Adapt attempts/thread toward TARGET_SEC; damp jumps to avoid overshoot.
+		if (adaptive && secs > 0.0) {
+			double next = attempts * (TARGET_SEC / secs);
+			if (next > attempts * 4.0) next = attempts * 4.0;  // ramp up gently
+			if (next < attempts * 0.25) next = attempts * 0.25; // back off fast
+			int n = (int)(next + 0.5);
+			if (n < MIN_ATT) n = MIN_ATT;
+			if (n > MAX_ATT) n = MAX_ATT;
+			attempts = n;
+		}
 	}
 }
 
@@ -167,7 +219,7 @@ void __global__ vanity_init(unsigned long long seed_base, curandState* state) {
 	curand_init(seed_base + id, id, 0, &state[id]);
 }
 
-void __global__ vanity_scan(curandState* state) {
+void __global__ vanity_scan(curandState* state, int attempts_per_thread) {
 	int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
 	// Local Kernel State
@@ -201,7 +253,7 @@ void __global__ vanity_scan(curandState* state) {
 	// and another that is warp efficient for bignum division to more
 	// efficiently scan for prefixes. Right now bs58enc cuts performance
 	// from 16M keys on my machine per second to 4M.
-	for (int attempts = 0; attempts < 100000; ++attempts) {
+	for (int attempts = 0; attempts < attempts_per_thread; ++attempts) {
 		// sha512_init Inlined
 		md.curlen   = 0;
 		md.length   = 0;

@@ -52,16 +52,19 @@ with the suffix. Only then is it stored. (This re-derivation is unit-tested in
 
 ## Windows (native) — recommended for an RTX 2060 on Windows
 
-**Prerequisites**
+### Prerequisites
+
 - NVIDIA GPU + driver (check in a terminal: `nvidia-smi`)
 - **CUDA Toolkit** for Windows (`nvcc --version` works)
 - **Visual Studio Build Tools** with the *Desktop development with C++* workload
   — this provides `cl.exe`, which `nvcc` needs as the host compiler.
 - Python 3.8+ (`py --version`)
 
-**Build & run** — `build.bat` auto-loads the Visual Studio C++ environment, so
-you can run it from a normal **PowerShell** (or cmd) prompt; no special
-"Native Tools" prompt needed. `cd` into this folder, then:
+### Build & run
+
+`build.bat` auto-loads the Visual Studio C++ environment, so you can run it
+from a normal **PowerShell** (or cmd) prompt; no special "Native Tools" prompt
+needed. `cd` into this folder, then:
 
 ```powershell
 # 1) Python deps for the orchestrator (the CUDA engine has no Python deps)
@@ -72,7 +75,9 @@ py -m pip install -r requirements.txt
 # -> produces engine\src\release\cuda_ed25519_vanity.exe
 #    Force the arch in PowerShell with:  $env:GPU_ARCH="sm_75"; .\build.bat
 
-# 3) Configure: copy .env.example to .env and set MONGODB_URI
+# 3) Configure: copy .env.example to .env and fill it in
+#    (either MONGODB_URI for direct/Atlas access, or the SSH_*/TLS block
+#     for a private MongoDB behind a bastion — see sections below)
 copy .env.example .env
 notepad .env
 
@@ -96,8 +101,9 @@ switch to WSL2.
 
 ## Linux / WSL2
 
-**Prerequisites:** NVIDIA driver (`nvidia-smi`), CUDA Toolkit (`nvcc --version`),
-Python 3.8+, and a MongoDB URI.
+Prerequisites: NVIDIA driver (`nvidia-smi`), CUDA Toolkit (`nvcc --version`),
+Python 3.8+, and a MongoDB URI (or the SSH tunnel + TLS env vars described
+[below](#mongodb--ssh-tunnel--tls-mode)).
 
 ```bash
 # 1) Python deps
@@ -144,17 +150,133 @@ set DRY_RUN=1 & set TARGET_COUNT=1 & py find_pump_keys.py
 
 ---
 
+## GPU utilization & performance
+
+The engine launches a grid that fills **every SM** on the GPU and auto-tunes how
+long each kernel runs (aiming ~0.5s) so the card stays busy without tripping
+**Windows TDR** (Windows resets the driver if a kernel blocks the display GPU
+for ~2 seconds). Watch the engine's own throughput line:
+
+```
+Attempts: 6144000 in 0.48 at 12800000 keys/sec (att/thread=20)
+```
+
+**“My GPU usage looks low in Task Manager.”** Windows Task Manager shows the
+**3D** engine by default, which CUDA does *not* use. Click a GPU graph's
+dropdown and pick **Cuda** or **Compute_0**, or — more reliably — run:
+
+```
+nvidia-smi -l 1
+```
+
+and look at the **GPU-Util %** column while the search runs. That is the real
+number. (CPU stays low on purpose: the work is on the GPU; the Python side only
+verifies the rare hits.)
+
+- If you see *"display driver stopped responding and has recovered"* (a TDR
+  reset), lower the launch size: set `VANITY_ATTEMPTS_PER_THREAD` to a small
+  fixed value (e.g. `8`).
+- If the GPU does **not** drive a monitor (headless/compute-only), you can push
+  throughput by setting a larger fixed `VANITY_ATTEMPTS_PER_THREAD` (e.g.
+  `5000`), since TDR doesn't apply.
+- Expected on an RTX 2060: a few million keys/sec, so a `pump` (4-char) hit
+  typically lands within seconds.
+
+---
+
+## Connecting to a private MongoDB via SSH tunnel + TLS
+
+If your MongoDB is on a private network reachable only through a bastion (and
+requires TLS), set the variables below in `.env`. `find_pump_keys.py` will open
+the SSH forward itself, then connect pymongo over the tunnel with TLS. In this
+mode `MONGODB_URI` is ignored — auth comes from the component vars instead.
+
+```ini
+# SSH access to the bastion (private-key auth only; no passwords)
+SSH_HOST=bastion.example.com
+SSH_PORT=22
+SSH_USER=ubuntu
+SSH_KEY_PATH=C:/Users/you/.ssh/id_ed25519     # path to your private key
+SSH_KEY_PASSPHRASE=                           # only if the key is encrypted
+
+# MongoDB host as seen FROM the bastion
+SSH_REMOTE_MONGO_HOST=127.0.0.1
+SSH_REMOTE_MONGO_PORT=27017
+
+# TLS to MongoDB
+MONGODB_TLS_CA_FILE=C:/path/to/ca.pem         # CA that signed Mongo's cert
+MONGODB_TLS_CERT_KEY_FILE=                    # only if mTLS — client cert+key PEM
+
+# MongoDB auth
+MONGODB_USERNAME=appuser
+MONGODB_PASSWORD=supersecret
+MONGODB_AUTH_SOURCE=admin
+MONGODB_AUTH_MECHANISM=SCRAM-SHA-256          # optional; pymongo auto-picks if blank
+
+MONGODB_DB=solana
+MONGODB_COLLECTION=pump_keys
+```
+
+A few practical notes:
+- **Host-key check.** SSH the bastion once manually first (`ssh -i <key>
+  <user>@<host>`) so its fingerprint lands in your `~/.ssh/known_hosts` —
+  otherwise the tunnel refuses to start.
+- **Replica sets.** The script sets `directConnection=true` so pymongo doesn't
+  try to reach other replica-set members at their advertised addresses (which
+  would bypass the tunnel). If you specifically need a replica-set connection,
+  forward each member's port individually.
+- **Cert paths.** Forward slashes work fine in Windows paths inside `.env`
+  (no need to escape backslashes).
+- **The CA file is for server verification.** Use `MONGODB_TLS_CERT_KEY_FILE`
+  only if your MongoDB requires client certificates (mTLS).
+
+---
+
 ## Configuration (environment variables)
 
-| Variable             | Default                                    | Meaning |
-|----------------------|--------------------------------------------|---------|
-| `MONGODB_URI`        | *(required unless `DRY_RUN=1`)*            | Mongo connection string |
-| `MONGODB_DB`         | `solana`                                   | Database name |
-| `MONGODB_COLLECTION` | `pump_keys`                                | Collection name |
-| `SUFFIX`             | `pump`                                      | Must match the engine build (see below) |
-| `TARGET_COUNT`       | `1`                                         | New keys to store before exiting; `0` = forever |
-| `VANITY_BIN`         | `engine/src/release/cuda_ed25519_vanity`   | Path to the compiled engine |
-| `DRY_RUN`            | `0`                                         | `1` = verify & print only, no DB |
+All of these can be set in `.env` (auto-loaded) or as real environment variables.
+
+### Search / engine
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SUFFIX` | `pump` | Must match the compiled engine (`engine/src/config.h`) |
+| `TARGET_COUNT` | `1` | New keys to store before exiting; `0` = run until Ctrl-C |
+| `VANITY_BIN` | `engine/src/release/cuda_ed25519_vanity[.exe]` | Path to the compiled engine |
+| `DRY_RUN` | `0` | `1` = verify & print only, no DB writes |
+| `VANITY_ATTEMPTS_PER_THREAD` | *(auto)* | Force a fixed launch size; blank = adaptive ~0.5s/launch |
+
+### MongoDB — URI mode
+
+Used when `SSH_HOST` is **not** set.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MONGODB_URI` | *(required)* | Standard mongodb:// or mongodb+srv:// URI |
+| `MONGODB_DB` | `solana` | Database name |
+| `MONGODB_COLLECTION` | `pump_keys` | Collection name |
+
+### MongoDB — SSH-tunnel + TLS mode
+
+Used when `SSH_HOST` is set. `MONGODB_URI` is ignored in this mode.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SSH_HOST` | — | Bastion hostname/IP |
+| `SSH_PORT` | `22` | SSH port |
+| `SSH_USER` | — | SSH username |
+| `SSH_KEY_PATH` | — | Path to your **private** key file |
+| `SSH_KEY_PASSPHRASE` | — | Only if the key is encrypted |
+| `SSH_REMOTE_MONGO_HOST` | `127.0.0.1` | MongoDB host *as seen from the bastion* |
+| `SSH_REMOTE_MONGO_PORT` | `27017` | MongoDB port *as seen from the bastion* |
+| `SSH_LOCAL_BIND_PORT` | `0` | `0` = auto-pick a free local port |
+| `MONGODB_TLS_CA_FILE` | — | CA cert that signed the MongoDB server cert |
+| `MONGODB_TLS_CERT_KEY_FILE` | — | Client cert+key PEM (mTLS only) |
+| `MONGODB_TLS_ALLOW_INVALID_HOSTNAMES` | `0` | Debug only — do not leave on |
+| `MONGODB_TLS_ALLOW_INVALID_CERTIFICATES` | `0` | Debug only — do not leave on |
+| `MONGODB_USERNAME` / `MONGODB_PASSWORD` | — | DB credentials |
+| `MONGODB_AUTH_SOURCE` | `admin` | Auth database |
+| `MONGODB_AUTH_MECHANISM` | *(auto)* | e.g. `SCRAM-SHA-256` |
 
 ---
 
@@ -194,34 +316,89 @@ Longer suffixes are exponentially slower (~58× per extra character).
 
 ## What was changed vs. upstream solanity
 
-All changes are confined to the vendored `engine/` tree:
+All changes are confined to the vendored `engine/` tree. The ed25519 / SHA-512 /
+base58 cryptography itself is upstream solanity, unchanged.
 
-- **`src/cuda-ecc-ed25519/vanity.cu`** — replaced the case-insensitive 6-char
-  *prefix-anywhere* matcher with a **case-sensitive suffix** match; emit a stable
-  `FOUND <address> <seed_base58>` line; seed the RNG randomly per run so reruns
-  explore new key space; run continuously until stopped.
+- **`src/cuda-ecc-ed25519/vanity.cu`**
+  - Replaced the case-insensitive 6-char *prefix-anywhere* matcher with a
+    **case-sensitive suffix** match (`pump`).
+  - Stable, greppable output: `FOUND <address> <seed_base58>`, plus
+    `fflush(stdout)` per launch so the host harness sees matches promptly
+    (there is no `stdbuf` on Windows).
+  - RNG seeded randomly per run from OS entropy so reruns explore new key space.
+  - Runs continuously until killed (the host harness stops it on target reached).
+  - **Full-SM grid:** upstream launched `maxActiveBlocks` blocks total — only
+    one SM's worth. Now launches `maxActiveBlocks × multiProcessorCount` to use
+    every SM (was the cause of the very low GPU utilization).
+  - **Adaptive launch sizing:** auto-tunes seeds-per-thread-per-launch toward
+    ~0.5s/launch so the GPU stays busy while staying well under the 2s
+    **Windows TDR** wall. Override with `VANITY_ATTEMPTS_PER_THREAD`.
+  - **Standalone-buildable on Windows:** dropped the unused `<pthread.h>` and
+    `gpu_ctx.h` includes (which dragged in `pthread_mutex_t`) and the one
+    external `ed25519_set_verbose` symbol from the shared lib. `vanity.cu` now
+    compiles to a single `.exe` with one `nvcc` invocation (no Makefile / no
+    `libcuda-crypt.so` / no `LD_LIBRARY_PATH`).
+- **`src/cuda-ecc-ed25519/fixedint.h`** — use real `<stdint.h>` on MSVC / CUDA.
+  Upstream's manual `typedef unsigned long uint32_t` collided with MSVC's
+  `typedef unsigned int uint32_t`, failing the Windows build.
 - **`src/config.h`** — `prefixes[]` → a single `suffix` string.
-- **`src/gpu-common.mk`** — modern default GPU arch (upstream `compute_35`/`sm_37`
-  was removed in CUDA 12) and dropped `-Werror` so a benign warning can't fail the
-  build.
-
-The ed25519 / SHA-512 / base58 cryptography is upstream solanity, unchanged.
+- **`src/gpu-common.mk`** — modern default GPU arch (upstream `compute_35` /
+  `sm_37` was removed in CUDA 12) and dropped `-Werror` so a benign warning on a
+  remote toolchain can't fail the build.
 
 ---
 
 ## Troubleshooting
 
-- **`nvcc: command not found`** — install the CUDA Toolkit and add it to `PATH`.
-- **`Unsupported gpu architecture 'compute_35'`** — you're on an old build; run
-  `./build.sh` (it sets a modern arch), or pass `GPU_ARCHS`/`GPU_PTX_ARCH`.
-- **`error while loading shared libraries: libcuda-crypt.so`** — run via
+### Build (Windows)
+
+- **`build.bat: not recognized` in PowerShell** — prefix with `.\` →
+  `.\build.bat`. Also use `$env:NAME="value"` instead of `set NAME=value` for
+  env vars.
+- **`Cannot find compiler 'cl.exe' in PATH`** — install **Build Tools for
+  Visual Studio** with the *Desktop development with C++* workload (`build.bat`
+  then auto-loads the MSVC environment). Quickest:
+  `winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`.
+- **`unsupported Microsoft Visual Studio version`** — your CUDA Toolkit is
+  older than your MSVC. Either install a newer CUDA, install an older MSVC
+  toolset, or open `build.bat` and add `-allow-unsupported-compiler` to the
+  `nvcc` line.
+
+### Build (Linux)
+
+- **`nvcc: command not found`** — install the CUDA Toolkit and add it to
+  `PATH`.
+- **`Unsupported gpu architecture 'compute_35'`** — old upstream default; run
+  `./build.sh` (sets a modern arch from `nvidia-smi`), or pass
+  `GPU_ARCHS=sm_75 GPU_PTX_ARCH=compute_75`.
+- **`libcuda-crypt.so: cannot open shared object file`** — run via
   `find_pump_keys.py` (it sets `LD_LIBRARY_PATH`), or
   `export LD_LIBRARY_PATH=engine/src/release:$LD_LIBRARY_PATH`.
-- **`[REJECTED]` lines** — the GPU produced a key that failed local
-  re-verification (it is *not* stored). This indicates a build/arch mismatch;
-  rebuild for your exact GPU.
-- **Mongo `ServerSelectionTimeoutError`** — check `MONGODB_URI`, network, and IP
-  allowlist (Atlas).
+
+### Runtime
+
+- **`[REJECTED]` lines** — the GPU produced a key whose seed didn't re-derive
+  to the reported address (the verifier rejected it; nothing was stored).
+  Usually a build/arch mismatch — rebuild for your exact GPU.
+- **`display driver stopped responding and has recovered`** — Windows TDR. The
+  adaptive tuner avoids this, but if it happens, set
+  `VANITY_ATTEMPTS_PER_THREAD=8` in `.env` to force tiny launches.
+
+### MongoDB / SSH
+
+- **`ServerSelectionTimeoutError`** (URI mode) — check `MONGODB_URI`, network,
+  IP allowlist (Atlas).
+- **`paramiko.SSHException: ... not found in known_hosts`** — SSH the bastion
+  once manually (`ssh -i <key> <user>@<host>`) so its fingerprint is recorded.
+- **`AuthenticationException`** (SSH) — wrong `SSH_USER`, wrong key file, or
+  the key isn't authorized on the bastion. Test outside the script first:
+  `ssh -i <SSH_KEY_PATH> <SSH_USER>@<SSH_HOST>`.
+- **`SSLCertVerificationError`** (Mongo TLS) — `MONGODB_TLS_CA_FILE` is wrong
+  or doesn't include the chain. To confirm it's hostname-related only,
+  temporarily set `MONGODB_TLS_ALLOW_INVALID_HOSTNAMES=1` (do **not** leave on).
+- **`Authentication failed`** (Mongo) — check `MONGODB_USERNAME` /
+  `MONGODB_PASSWORD` / `MONGODB_AUTH_SOURCE`. If your server requires a
+  specific mechanism, set `MONGODB_AUTH_MECHANISM=SCRAM-SHA-256`.
 
 ---
 

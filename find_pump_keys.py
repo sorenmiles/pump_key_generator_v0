@@ -107,26 +107,118 @@ def verify_keypair(address: str, seed_b58: str):
     return derived, private_key_b58, list(raw64)
 
 
-def open_collection():
-    """Connect to MongoDB and return a collection with a unique index."""
-    from pymongo import ASCENDING, MongoClient
+def _truthy(s):
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
 
-    uri = env("MONGODB_URI")
-    if not uri:
-        log("ERROR: MONGODB_URI is not set. Set it, or run with DRY_RUN=1 to "
-            "test the engine without a database.")
+
+def _open_ssh_tunnel():
+    """Open an SSH tunnel to a private MongoDB host. Returns (tunnel, local_port).
+
+    Activated when SSH_HOST is set. Uses public-key auth (SSH_KEY_PATH), with an
+    optional passphrase. The tunnel forwards a local loopback port to the
+    MongoDB host as seen from the SSH server.
+    """
+    from sshtunnel import SSHTunnelForwarder
+
+    ssh_host = env("SSH_HOST")
+    ssh_port = int(env("SSH_PORT", "22"))
+    ssh_user = env("SSH_USER")
+    ssh_key  = env("SSH_KEY_PATH")
+    if not (ssh_user and ssh_key):
+        log("ERROR: SSH mode needs SSH_USER and SSH_KEY_PATH (private key file).")
+        sys.exit(1)
+    ssh_key = os.path.expanduser(ssh_key)
+    if not os.path.isfile(ssh_key):
+        log(f"ERROR: SSH key file not found: {ssh_key}")
         sys.exit(1)
 
-    db_name = env("MONGODB_DB", "solana")
+    remote_host = env("SSH_REMOTE_MONGO_HOST", "127.0.0.1")
+    remote_port = int(env("SSH_REMOTE_MONGO_PORT", "27017"))
+    local_port  = int(env("SSH_LOCAL_BIND_PORT", "0"))   # 0 -> auto-pick free port
+
+    log(f">> Opening SSH tunnel: {ssh_user}@{ssh_host}:{ssh_port}"
+        f"  -> {remote_host}:{remote_port}")
+    tunnel = SSHTunnelForwarder(
+        (ssh_host, ssh_port),
+        ssh_username=ssh_user,
+        ssh_pkey=ssh_key,
+        ssh_private_key_password=env("SSH_KEY_PASSPHRASE"),
+        remote_bind_address=(remote_host, remote_port),
+        local_bind_address=("127.0.0.1", local_port),
+    )
+    tunnel.start()
+    log(f"   tunnel listening on 127.0.0.1:{tunnel.local_bind_port}")
+    return tunnel, tunnel.local_bind_port
+
+
+def open_collection():
+    """Connect to MongoDB (optionally via SSH tunnel + TLS).
+
+    Returns (client, collection, tunnel_or_None). Caller must close the client
+    AND stop the tunnel when done.
+
+    Two connection modes:
+      * SSH tunnel mode: SSH_HOST is set. We open a forward to the private
+        MongoDB host and connect over TLS using component env vars
+        (MONGODB_USERNAME / MONGODB_PASSWORD / MONGODB_AUTH_SOURCE), with
+        MONGODB_TLS_CA_FILE and optional MONGODB_TLS_CERT_KEY_FILE.
+      * URI mode: just use MONGODB_URI as-is (Atlas, local, etc.).
+    """
+    from pymongo import ASCENDING, MongoClient
+
+    db_name   = env("MONGODB_DB", "solana")
     coll_name = env("MONGODB_COLLECTION", "pump_keys")
 
-    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
-    client.admin.command("ping")             # fail fast on bad URI/credentials
+    tunnel = None
+    if env("SSH_HOST"):
+        tunnel, local_port = _open_ssh_tunnel()
+
+        tls_ca   = env("MONGODB_TLS_CA_FILE")
+        tls_cert = env("MONGODB_TLS_CERT_KEY_FILE")
+        if not tls_ca:
+            log("WARN: MONGODB_TLS_CA_FILE not set; the server's TLS cert "
+                "won't be verified against a CA (set it for proper TLS).")
+
+        kwargs = dict(
+            host="127.0.0.1",
+            port=local_port,
+            authSource=env("MONGODB_AUTH_SOURCE", "admin"),
+            tls=True,
+            tlsCAFile=os.path.expanduser(tls_ca) if tls_ca else None,
+            tlsAllowInvalidHostnames=_truthy(
+                env("MONGODB_TLS_ALLOW_INVALID_HOSTNAMES", "0")),
+            tlsAllowInvalidCertificates=_truthy(
+                env("MONGODB_TLS_ALLOW_INVALID_CERTIFICATES", "0")),
+            # Force single-host connect; otherwise pymongo may try to reach
+            # other replica-set members directly, bypassing our tunnel.
+            directConnection=True,
+            serverSelectionTimeoutMS=15000,
+        )
+        if tls_cert:
+            kwargs["tlsCertificateKeyFile"] = os.path.expanduser(tls_cert)
+        if env("MONGODB_USERNAME"):
+            kwargs["username"] = env("MONGODB_USERNAME")
+            kwargs["password"] = env("MONGODB_PASSWORD")
+        if env("MONGODB_AUTH_MECHANISM"):
+            kwargs["authMechanism"] = env("MONGODB_AUTH_MECHANISM")
+        # Drop None values so pymongo uses its own defaults.
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+        client = MongoClient(**kwargs)
+    else:
+        uri = env("MONGODB_URI")
+        if not uri:
+            log("ERROR: neither MONGODB_URI nor SSH_HOST is set. Configure one "
+                "(or run with DRY_RUN=1 to test the engine without a database).")
+            sys.exit(1)
+        client = MongoClient(uri, serverSelectionTimeoutMS=15000)
+
+    client.admin.command("ping")             # fail fast on bad config / network
     coll = client[db_name][coll_name]
     # Prevent duplicate addresses from ever being stored twice.
     coll.create_index([("public_key", ASCENDING)], unique=True)
     log(f">> MongoDB connected: db={db_name!r} collection={coll_name!r}")
-    return client, coll
+    return client, coll, tunnel
 
 
 def store(coll, address, private_key_b58, secret_key_json):
@@ -193,9 +285,9 @@ def main():
     log(f"  mode         : {'DRY RUN (no DB writes)' if DRY_RUN else 'store to MongoDB'}")
     log("=" * 70)
 
-    client = coll = None
+    client = coll = ssh_tunnel = None
     if not DRY_RUN:
-        client, coll = open_collection()
+        client, coll, ssh_tunnel = open_collection()
 
     cmd = build_command()
     proc = subprocess.Popen(
@@ -232,7 +324,7 @@ def main():
 
             if not line.startswith("FOUND "):
                 # Engine status / performance lines: surface them quietly.
-                if line.startswith("Attempts:") or line.startswith("GPU:"):
+                if line.split(":", 1)[0] in ("Attempts", "GPU", "CONFIG", "END"):
                     log("   [engine] " + line)
                 continue
 
@@ -276,6 +368,11 @@ def main():
         shutdown()
         if client is not None:
             client.close()
+        if ssh_tunnel is not None:
+            try:
+                ssh_tunnel.stop()
+            except Exception:
+                pass
 
     log(f">> Done. {stored} key(s) {'verified' if DRY_RUN else 'stored'}.")
 

@@ -3,3 +3,5 @@
 pymongo>=4.6,<5
 solders>=0.21          # trusted ed25519 / Solana keypair derivation + verify
 base58>=2.1
+sshtunnel>=0.4         # optional SSH-tunnel to a private MongoDB host
+paramiko>=3.0          # SSH transport (pulled in by sshtunnel; pinned for ed25519 key support)
