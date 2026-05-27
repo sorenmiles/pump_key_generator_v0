@@ -49,7 +49,12 @@ def _load_dotenv():
     """Load KEY=VALUE pairs from a sibling .env file (no dependency needed).
 
     Cross-platform convenience so Windows users don't need `source .env`. Real
-    environment variables already set take precedence over the file.
+    environment variables already set take precedence over the file. Supports:
+      KEY=value                           # plain value
+      KEY="value"                         # quoted (preserves spaces)
+      KEY=value   # trailing comment      # comment is stripped
+      KEY="value"   # trailing comment    # closing quote ends the value
+      KEY='val with # literal hash'       # # inside quotes is part of the value
     """
     path = os.path.join(HERE, ".env")
     if not os.path.isfile(path):
@@ -61,7 +66,19 @@ def _load_dotenv():
                 continue
             key, val = line.split("=", 1)
             key = key.strip()
-            val = val.strip().strip('"').strip("'")
+            val = val.lstrip()
+            if val[:1] in ('"', "'"):
+                # Quoted value: take everything up to the matching closing
+                # quote; anything after it (e.g. " # comment") is discarded.
+                quote = val[0]
+                end = val.find(quote, 1)
+                val = val[1:end] if end != -1 else val[1:]
+            else:
+                # Unquoted: a '#' starts an inline comment.
+                hashpos = val.find("#")
+                if hashpos != -1:
+                    val = val[:hashpos]
+                val = val.rstrip()
             os.environ.setdefault(key, val)
 
 
@@ -111,6 +128,78 @@ def _truthy(s):
     return str(s).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _ssh_diagnose(ssh_host, ssh_port, ssh_user, ssh_key, passphrase):
+    """Run a paramiko probe to print a clear, actionable reason for an SSH failure.
+
+    sshtunnel collapses every failure into one generic message; this routine
+    reproduces just the SSH handshake with paramiko so we can tell the user
+    whether it was a key-parse problem, server reject, or network issue.
+    """
+    import paramiko, socket
+    # 1) Can we even reach the port?
+    try:
+        with socket.create_connection((ssh_host, ssh_port), timeout=10):
+            pass
+    except OSError as e:
+        log(f"   [diag] cannot TCP-connect to {ssh_host}:{ssh_port}: {e}")
+        return
+
+    # 2) Can paramiko parse the private key? Try every common type.
+    pkey, parsed_as = None, None
+    for cls in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
+        try:
+            pkey = cls.from_private_key_file(ssh_key, password=passphrase or None)
+            parsed_as = cls.__name__
+            break
+        except paramiko.PasswordRequiredException:
+            log(f"   [diag] key {ssh_key} is encrypted; set SSH_KEY_PASSPHRASE.")
+            return
+        except (paramiko.SSHException, ValueError):
+            continue
+    if pkey is None:
+        log(f"   [diag] paramiko could not parse {ssh_key}. "
+            f"Confirm it is the PRIVATE key (not .pub) in OpenSSH/PEM format. "
+            f"Sanity check on Windows:  ssh-keygen -y -f \"{ssh_key}\"")
+        return
+    log(f"   [diag] key parsed as {parsed_as}")
+
+    # 3) Try the actual SSH auth.
+    try:
+        t = paramiko.Transport((ssh_host, ssh_port))
+        t.start_client(timeout=15)
+    except paramiko.SSHException as e:
+        log(f"   [diag] SSH protocol handshake failed: {e}")
+        return
+    try:
+        try:
+            t.auth_publickey(ssh_user, pkey)
+            log(f"   [diag] paramiko auth SUCCEEDED for {ssh_user}@{ssh_host} — "
+                f"the failure is somewhere else in sshtunnel.")
+        except paramiko.AuthenticationException:
+            log(f"   [diag] server REJECTED the key for user {ssh_user!r}. "
+                f"Confirm the matching public key is in "
+                f"{ssh_user}@{ssh_host}:~/.ssh/authorized_keys, that the file "
+                f"perms are 600, and that SSH_USER is right.")
+        except paramiko.SSHException as e:
+            log(f"   [diag] SSH error during auth: {e}")
+    finally:
+        try: t.close()
+        except Exception: pass
+
+
+def _make_sshtunnel_logger():
+    """Detailed stderr logger so sshtunnel's underlying error is visible."""
+    import logging
+    logger = logging.getLogger("vanity.sshtunnel")
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("   [ssh] %(levelname)s %(message)s"))
+        logger.addHandler(h)
+        logger.propagate = False
+    logger.setLevel(logging.INFO)
+    return logger
+
+
 def _open_ssh_tunnel():
     """Open an SSH tunnel to a private MongoDB host. Returns (tunnel, local_port).
 
@@ -118,12 +207,13 @@ def _open_ssh_tunnel():
     optional passphrase. The tunnel forwards a local loopback port to the
     MongoDB host as seen from the SSH server.
     """
-    from sshtunnel import SSHTunnelForwarder
+    from sshtunnel import SSHTunnelForwarder, BaseSSHTunnelForwarderError
 
     ssh_host = env("SSH_HOST")
     ssh_port = int(env("SSH_PORT", "22"))
     ssh_user = env("SSH_USER")
     ssh_key  = env("SSH_KEY_PATH")
+    passphrase = env("SSH_KEY_PASSPHRASE")
     if not (ssh_user and ssh_key):
         log("ERROR: SSH mode needs SSH_USER and SSH_KEY_PATH (private key file).")
         sys.exit(1)
@@ -142,11 +232,22 @@ def _open_ssh_tunnel():
         (ssh_host, ssh_port),
         ssh_username=ssh_user,
         ssh_pkey=ssh_key,
-        ssh_private_key_password=env("SSH_KEY_PASSPHRASE"),
+        ssh_private_key_password=passphrase,
         remote_bind_address=(remote_host, remote_port),
         local_bind_address=("127.0.0.1", local_port),
+        # Limit sshtunnel to ONLY the key we pass; don't let it scan ~/.ssh or
+        # the SSH agent (which can introduce noisy unrelated failures).
+        allow_agent=False,
+        host_pkey_directories=[],
+        logger=_make_sshtunnel_logger(),
     )
-    tunnel.start()
+    try:
+        tunnel.start()
+    except BaseSSHTunnelForwarderError as e:
+        log(f"ERROR: SSH tunnel failed: {e}")
+        log("   running a direct paramiko probe to surface the actual reason...")
+        _ssh_diagnose(ssh_host, ssh_port, ssh_user, ssh_key, passphrase)
+        sys.exit(1)
     log(f"   tunnel listening on 127.0.0.1:{tunnel.local_bind_port}")
     return tunnel, tunnel.local_bind_port
 

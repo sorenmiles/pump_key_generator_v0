@@ -6,8 +6,8 @@ verified keypair in MongoDB with `private_key`, `public_key`, and `isused=false`
 
 ```
  ┌─────────────────────┐   FOUND <address> <seed>   ┌──────────────────────────┐
- │  CUDA engine (GPU)   │ ─────────────────────────► │  find_pump_keys.py       │
- │  brute-force search  │                            │  re-derive + verify key  │
+ │  CUDA engine (GPU)  │ ─────────────────────────► │  find_pump_keys.py       │
+ │  brute-force search │                            │  re-derive + verify key  │
  └─────────────────────┘                            │  store in MongoDB        │
                                                      └──────────────────────────┘
 ```
